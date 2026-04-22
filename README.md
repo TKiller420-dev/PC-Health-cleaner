@@ -70,6 +70,28 @@ Review results before removing anything.
 14. Snapshot delta view between recent runs
 15. Operator notes integrated into report export
 
+## 20 New Integrity Ideas/Upgrades/Tools/Checks
+1. Integrity Lab module/tab dedicated to corruption and broken-app analysis
+2. Deep integrity mode toggle for expanded checks
+3. Metadata access failure check (critical)
+4. Zero-byte file corruption check
+5. Partial download artifact check (`.part`, `.crdownload`, etc.)
+6. Tiny executable/library anomaly check
+7. PE header validity check for `.exe` and `.dll`
+8. ZIP archive index/readability integrity check
+9. Config parse check for JSON-like config files
+10. Sibling version clash check (same stem, inconsistent sizes)
+11. Orphan app folder check (DLL-heavy folders missing EXE)
+12. Startup entry saturation check in startup folders
+13. Integrity score calculation (0-100)
+14. Severity bucket counters (critical/warning/info)
+15. Baseline score capture and delta display
+16. Integrity issue filter (path/check/details text)
+17. Critical-only filter mode
+18. Integrity report JSON export
+19. Integrity report CSV export
+20. Auto-generated repair playbook + selected issue folder open/ignore helpers
+
 ## Local Data Location
 - `%APPDATA%/NexusPcCleaner/config.json`
 - `%APPDATA%/NexusPcCleaner/history.json`

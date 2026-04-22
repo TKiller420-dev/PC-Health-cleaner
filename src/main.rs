@@ -1,5 +1,6 @@
 mod cleanup;
 mod health;
+mod integrity;
 mod models;
 mod scanner;
 mod storage;
@@ -9,7 +10,10 @@ use eframe::egui::{
     SidePanel, Stroke, TopBottomPanel,
 };
 use eframe::{App, NativeOptions};
-use models::{AppConfig, CleanupMode, HealthReport, HistoryEntry, RunMode, ScanSummary};
+use models::{
+    AppConfig, CleanupMode, HealthReport, HistoryEntry, IntegrityIssue, IntegrityReport, RunMode,
+    ScanSummary,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -50,6 +54,7 @@ enum UiTab {
     Dashboard,
     Cleaner,
     Health,
+    Integrity,
     Automation,
     Tools,
 }
@@ -92,6 +97,14 @@ struct CleanerApp {
     selected_quarantine_idx: usize,
     selected_root_preset: usize,
     notes: String,
+    integrity_report: Option<IntegrityReport>,
+    integrity_deep: bool,
+    integrity_filter: String,
+    show_only_critical: bool,
+    issue_limit: usize,
+    selected_issue_idx: usize,
+    integrity_export_file: String,
+    integrity_baseline_score: Option<u8>,
 }
 
 impl Default for CleanerApp {
@@ -127,6 +140,14 @@ impl Default for CleanerApp {
             selected_quarantine_idx: 0,
             selected_root_preset: 0,
             notes: String::new(),
+            integrity_report: None,
+            integrity_deep: true,
+            integrity_filter: String::new(),
+            show_only_critical: false,
+            issue_limit: 400,
+            selected_issue_idx: 0,
+            integrity_export_file: "nexus_integrity_report.json".into(),
+            integrity_baseline_score: None,
         }
     }
 }
@@ -454,6 +475,164 @@ impl CleanerApp {
         }
     }
 
+    fn run_integrity(&mut self) {
+        let roots = self.parse_roots();
+        if roots.is_empty() {
+            self.status = "No valid scan roots for integrity checks.".into();
+            return;
+        }
+        self.status = "Running corruption/broken-app integrity checks...".into();
+        self.integrity_report = Some(integrity::run_integrity_checks(&roots, self.integrity_deep));
+        self.status = "Integrity checks complete.".into();
+    }
+
+    fn visible_integrity_issues(&self) -> Vec<IntegrityIssue> {
+        let Some(report) = &self.integrity_report else {
+            return Vec::new();
+        };
+        let filter = self.integrity_filter.to_ascii_lowercase();
+
+        report
+            .issues
+            .iter()
+            .filter(|issue| {
+                if self.show_only_critical && issue.severity != "critical" {
+                    return false;
+                }
+                if filter.is_empty() {
+                    return true;
+                }
+                issue.path.to_ascii_lowercase().contains(&filter)
+                    || issue.check.to_ascii_lowercase().contains(&filter)
+                    || issue.details.to_ascii_lowercase().contains(&filter)
+            })
+            .take(self.issue_limit)
+            .cloned()
+            .collect()
+    }
+
+    fn export_integrity_json(&mut self) {
+        let Some(report) = &self.integrity_report else {
+            self.status = "Run integrity checks before exporting.".into();
+            return;
+        };
+
+        match serde_json::to_string_pretty(report) {
+            Ok(raw) => {
+                let path = PathBuf::from(self.integrity_export_file.trim());
+                if fs::write(&path, raw).is_ok() {
+                    self.status = format!("Integrity JSON exported to {}", path.display());
+                } else {
+                    self.status = "Failed to export integrity JSON.".into();
+                }
+            }
+            Err(_) => {
+                self.status = "Failed to serialize integrity report.".into();
+            }
+        }
+    }
+
+    fn export_integrity_csv(&mut self) {
+        let Some(report) = &self.integrity_report else {
+            self.status = "Run integrity checks before exporting CSV.".into();
+            return;
+        };
+
+        let csv_path = PathBuf::from(self.integrity_export_file.trim().replace(".json", ".csv"));
+        let mut out = String::from("check,severity,path,details,fix_hint\n");
+        for issue in &report.issues {
+            let row = format!(
+                "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"\n",
+                issue.check.replace('"', "'"),
+                issue.severity.replace('"', "'"),
+                issue.path.replace('"', "'"),
+                issue.details.replace('"', "'"),
+                issue.fix_hint.replace('"', "'")
+            );
+            out.push_str(&row);
+        }
+
+        if fs::write(&csv_path, out).is_ok() {
+            self.status = format!("Integrity CSV exported to {}", csv_path.display());
+        } else {
+            self.status = "Failed to export integrity CSV.".into();
+        }
+    }
+
+    fn write_repair_playbook(&mut self) {
+        let Some(report) = &self.integrity_report else {
+            self.status = "Run integrity checks before generating a repair playbook.".into();
+            return;
+        };
+
+        let path = PathBuf::from("nexus_repair_playbook.txt");
+        let mut text = String::new();
+        text.push_str("Nexus Repair Playbook\n");
+        text.push_str(&format!("Generated: {}\n\n", now_rfc3339()));
+        for (idx, issue) in report.issues.iter().take(120).enumerate() {
+            text.push_str(&format!(
+                "{}. [{}] {}\nPath: {}\nFix: {}\n\n",
+                idx + 1,
+                issue.severity,
+                issue.check,
+                issue.path,
+                issue.fix_hint
+            ));
+        }
+        if fs::write(&path, text).is_ok() {
+            self.status = format!("Repair playbook written to {}", path.display());
+        } else {
+            self.status = "Failed to write repair playbook.".into();
+        }
+    }
+
+    fn set_integrity_baseline(&mut self) {
+        let Some(report) = &self.integrity_report else {
+            self.status = "Run integrity checks first to set a baseline.".into();
+            return;
+        };
+        self.integrity_baseline_score = Some(report.integrity_score);
+        self.status = format!("Integrity baseline set at {}", report.integrity_score);
+    }
+
+    fn add_selected_issue_parent_to_ignore(&mut self) {
+        let issues = self.visible_integrity_issues();
+        if issues.is_empty() {
+            self.status = "No visible integrity issues to add ignore token from.".into();
+            return;
+        }
+        let idx = self.selected_issue_idx.min(issues.len() - 1);
+        let path = PathBuf::from(&issues[idx].path);
+        if let Some(parent) = path.parent() {
+            let token = parent.to_string_lossy().to_string();
+            if !self.config.ignored_paths.iter().any(|p| p.eq_ignore_ascii_case(&token)) {
+                self.config.ignored_paths.push(token.clone());
+                self.save_config();
+                self.status = format!("Added ignore path token from selected issue: {}", token);
+            } else {
+                self.status = "Selected issue parent path token is already in ignore list.".into();
+            }
+        } else {
+            self.status = "Selected issue path has no parent directory.".into();
+        }
+    }
+
+    fn open_selected_issue_folder(&mut self) {
+        let issues = self.visible_integrity_issues();
+        if issues.is_empty() {
+            self.status = "No visible integrity issues to open.".into();
+            return;
+        }
+        let idx = self.selected_issue_idx.min(issues.len() - 1);
+        let issue_path = PathBuf::from(&issues[idx].path);
+        let target = if issue_path.is_dir() {
+            issue_path
+        } else {
+            issue_path.parent().map(PathBuf::from).unwrap_or(issue_path)
+        };
+        self.open_path_in_explorer(target);
+    }
+
     fn snapshot_delta(&self) -> Option<(i64, i64, f64)> {
         if self.history.len() < 2 {
             return None;
@@ -510,6 +689,7 @@ impl CleanerApp {
                 ui.selectable_value(&mut self.tab, UiTab::Dashboard, "Dashboard");
                 ui.selectable_value(&mut self.tab, UiTab::Cleaner, "Cleaner");
                 ui.selectable_value(&mut self.tab, UiTab::Health, "Health Lab");
+                ui.selectable_value(&mut self.tab, UiTab::Integrity, "Integrity Lab");
                 ui.selectable_value(&mut self.tab, UiTab::Automation, "Automation");
                 ui.selectable_value(&mut self.tab, UiTab::Tools, "Tool Deck");
 
@@ -800,6 +980,103 @@ impl CleanerApp {
         });
     }
 
+    fn render_integrity_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading(RichText::new("Integrity Lab").size(24.0));
+        ui.label("Corruption and broken app checks for files, archives, configs, binaries, and install trees.");
+
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.integrity_deep, "Deep mode");
+            ui.checkbox(&mut self.show_only_critical, "Critical only");
+            ui.label("Issue limit:");
+            ui.add(egui::DragValue::new(&mut self.issue_limit).range(20..=2000));
+            if ui.button("Run Integrity Checks").clicked() {
+                self.run_integrity();
+            }
+            if ui.button("Set Baseline").clicked() {
+                self.set_integrity_baseline();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Filter issues:");
+            ui.text_edit_singleline(&mut self.integrity_filter);
+            ui.label("Export file:");
+            ui.text_edit_singleline(&mut self.integrity_export_file);
+            if ui.button("Export JSON").clicked() {
+                self.export_integrity_json();
+            }
+            if ui.button("Export CSV").clicked() {
+                self.export_integrity_csv();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Generate Repair Playbook").clicked() {
+                self.write_repair_playbook();
+            }
+            if ui.button("Open Selected Issue Folder").clicked() {
+                self.open_selected_issue_folder();
+            }
+            if ui.button("Ignore Selected Issue Parent").clicked() {
+                self.add_selected_issue_parent_to_ignore();
+            }
+        });
+
+        if let Some(report) = &self.integrity_report {
+            let baseline_delta = self
+                .integrity_baseline_score
+                .map(|b| report.integrity_score as i64 - b as i64);
+            ui.group(|ui| {
+                ui.label(RichText::new("Integrity Summary").strong());
+                ui.label(format!("Score: {}", report.integrity_score));
+                if let Some(delta) = baseline_delta {
+                    ui.label(format!("Delta vs baseline: {:+}", delta));
+                }
+                ui.label(format!("Files scanned: {}", report.files_scanned));
+                ui.label(format!("Checks active: {}", report.check_count));
+                ui.label(format!(
+                    "Issues critical:{} warning:{} info:{}",
+                    report.critical_count, report.warning_count, report.info_count
+                ));
+                ui.add(ProgressBar::new(report.integrity_score as f32 / 100.0).show_percentage());
+            });
+
+            let visible = self.visible_integrity_issues();
+            if !visible.is_empty() {
+                let max_idx = visible.len() - 1;
+                if self.selected_issue_idx > max_idx {
+                    self.selected_issue_idx = max_idx;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Selected issue:");
+                    ui.add(egui::DragValue::new(&mut self.selected_issue_idx).range(0..=max_idx));
+                });
+            }
+
+            ScrollArea::vertical().max_height(470.0).show(ui, |ui| {
+                for issue in visible.iter().take(self.issue_limit) {
+                    let severity_color = match issue.severity.as_str() {
+                        "critical" => Color32::from_rgb(255, 120, 120),
+                        "warning" => Color32::from_rgb(255, 205, 120),
+                        _ => Color32::from_rgb(147, 225, 245),
+                    };
+                    ui.group(|ui| {
+                        ui.label(
+                            RichText::new(format!("{} [{}]", issue.check, issue.severity))
+                                .strong()
+                                .color(severity_color),
+                        );
+                        ui.label(&issue.path);
+                        ui.label(&issue.details);
+                        ui.label(format!("Fix: {}", issue.fix_hint));
+                    });
+                }
+            });
+        } else {
+            ui.label("Run integrity checks to get corruption and broken-app findings.");
+        }
+    }
+
     fn render_tools_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Tool Deck").size(24.0));
 
@@ -869,6 +1146,7 @@ impl App for CleanerApp {
                     UiTab::Dashboard => self.render_dashboard_tab(ui),
                     UiTab::Cleaner => self.render_cleaner_tab(ui),
                     UiTab::Health => self.render_health_tab(ui),
+                    UiTab::Integrity => self.render_integrity_tab(ui),
                     UiTab::Automation => self.render_automation_tab(ui),
                     UiTab::Tools => self.render_tools_tab(ui),
                 });

@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+
+# Editor and IDE settings
+.vscode/
+.idea/
+*.code-workspace
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Runtime/exported reports from this app
+nexus_report.json
+nexus_integrity_report.json
+nexus_integrity_report.csv
+nexus_repair_playbook.txt
+
+# Logs and temp artifacts
+*.log
+*.tmp
+*.temp
