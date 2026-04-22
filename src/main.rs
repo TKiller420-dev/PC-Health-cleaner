@@ -4,6 +4,7 @@ mod integrity;
 mod models;
 mod scanner;
 mod storage;
+mod updater;
 
 use eframe::egui::{
     self, Align, CentralPanel, Color32, Context, Frame, Layout, ProgressBar, RichText, ScrollArea,
@@ -17,6 +18,9 @@ use models::{
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn now_rfc3339() -> String {
     chrono::Local::now().to_rfc3339()
@@ -105,6 +109,14 @@ struct CleanerApp {
     selected_issue_idx: usize,
     integrity_export_file: String,
     integrity_baseline_score: Option<u8>,
+    auto_update_enabled: bool,
+    update_in_flight: bool,
+    update_status_message: String,
+    update_status_kind: Option<updater::UpdateStatus>,
+    downloaded_update_path: Option<PathBuf>,
+    downloaded_update_version: Option<String>,
+    update_rx: Option<Receiver<updater::UpdateCheckResult>>,
+    last_update_check_at: Option<Instant>,
 }
 
 impl Default for CleanerApp {
@@ -148,6 +160,14 @@ impl Default for CleanerApp {
             selected_issue_idx: 0,
             integrity_export_file: "nexus_integrity_report.json".into(),
             integrity_baseline_score: None,
+            auto_update_enabled: true,
+            update_in_flight: false,
+            update_status_message: "Release manager idle.".into(),
+            update_status_kind: None,
+            downloaded_update_path: None,
+            downloaded_update_version: None,
+            update_rx: None,
+            last_update_check_at: None,
         }
     }
 }
@@ -484,6 +504,78 @@ impl CleanerApp {
         self.status = "Running corruption/broken-app integrity checks...".into();
         self.integrity_report = Some(integrity::run_integrity_checks(&roots, self.integrity_deep));
         self.status = "Integrity checks complete.".into();
+    }
+
+    fn trigger_update_check(&mut self, manual: bool) {
+        if self.update_in_flight {
+            self.update_status_message = "An update check is already running.".into();
+            return;
+        }
+
+        self.update_in_flight = true;
+        self.last_update_check_at = Some(Instant::now());
+        self.update_status_message = if manual {
+            "Checking for a newer build...".into()
+        } else {
+            "Running automatic update check...".into()
+        };
+        self.update_status_kind = Some(updater::UpdateStatus::Checking);
+
+        let existing_path = self.downloaded_update_path.clone();
+        let existing_version = self.downloaded_update_version.clone();
+        let (tx, rx) = mpsc::channel::<updater::UpdateCheckResult>();
+        self.update_rx = Some(rx);
+
+        thread::spawn(move || {
+            let result = updater::check_for_updates(manual, existing_path, existing_version);
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_update_results(&mut self) {
+        if let Some(rx) = &self.update_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.update_in_flight = false;
+                self.update_status_message = result.message;
+                self.update_status_kind = Some(result.status.clone());
+                self.downloaded_update_path = result.downloaded_path;
+                self.downloaded_update_version = result.downloaded_version;
+                self.update_rx = None;
+            }
+        }
+    }
+
+    fn run_auto_update_check_if_due(&mut self) {
+        if !self.auto_update_enabled || self.update_in_flight {
+            return;
+        }
+
+        let interval = Duration::from_secs(3 * 60);
+        let due = self
+            .last_update_check_at
+            .map(|when| when.elapsed() >= interval)
+            .unwrap_or(true);
+
+        if due {
+            self.trigger_update_check(false);
+        }
+    }
+
+    fn install_downloaded_update(&mut self) {
+        let Some(path) = self.downloaded_update_path.clone() else {
+            self.update_status_message = "No downloaded update is ready.".into();
+            return;
+        };
+
+        match updater::install_downloaded_update(&path) {
+            Ok(_) => {
+                self.update_status_message = "Applying update and restarting now...".into();
+                std::process::exit(0);
+            }
+            Err(e) => {
+                self.update_status_message = format!("Failed to start update installer: {e}");
+            }
+        }
     }
 
     fn visible_integrity_issues(&self) -> Vec<IntegrityIssue> {
@@ -1080,6 +1172,44 @@ impl CleanerApp {
     fn render_tools_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Tool Deck").size(24.0));
 
+        ui.group(|ui| {
+            ui.label(RichText::new("Release Manager").strong());
+            ui.label(format!("Current version: v{}", env!("CARGO_PKG_VERSION")));
+            ui.checkbox(&mut self.auto_update_enabled, "Enable auto-update checks (every 3 minutes)");
+
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Check Updates").clicked() {
+                    self.trigger_update_check(true);
+                }
+                if ui
+                    .add_enabled(
+                        self.downloaded_update_path.is_some(),
+                        egui::Button::new("Restart and Install Downloaded Update"),
+                    )
+                    .clicked()
+                {
+                    self.install_downloaded_update();
+                }
+            });
+
+            if let Some(version) = &self.downloaded_update_version {
+                ui.label(format!("Downloaded update ready: v{}", version));
+            }
+            if let Some(kind) = &self.update_status_kind {
+                let label = match kind {
+                    updater::UpdateStatus::UpToDate => "State: up-to-date",
+                    updater::UpdateStatus::Downloaded => "State: update downloaded",
+                    updater::UpdateStatus::Unavailable => "State: unavailable",
+                    updater::UpdateStatus::Checking => "State: checking",
+                    updater::UpdateStatus::Error => "State: error",
+                };
+                ui.label(label);
+            }
+            ui.label(&self.update_status_message);
+        });
+
+        ui.add_space(8.0);
+
         ui.horizontal_wrapped(|ui| {
             if ui.button("Open Quarantine Folder").clicked() {
                 self.open_path_in_explorer(storage::quarantine_dir());
@@ -1133,6 +1263,8 @@ impl CleanerApp {
 
 impl App for CleanerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.poll_update_results();
+        self.run_auto_update_check_if_due();
         self.apply_theme(ctx);
         self.render_top_bar(ctx);
         self.render_side_tabs(ctx);

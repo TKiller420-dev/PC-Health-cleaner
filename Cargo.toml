@@ -1,6 +1,6 @@
 [package]
 name = "pc-health-cleaner"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
 
 [dependencies]
@@ -16,3 +16,5 @@ chrono = { version = "0.4", features = ["clock"] }
 thiserror = "2.0"
 sysinfo = "0.32"
 home = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+semver = "1.0"

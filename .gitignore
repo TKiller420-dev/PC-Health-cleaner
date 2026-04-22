@@ -20,3 +20,6 @@ nexus_repair_playbook.txt
 *.log
 *.tmp
 *.temp
+
+# Local release tooling
+/release-tools/

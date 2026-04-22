@@ -40,6 +40,9 @@ A fast desktop prototype built in Rust + egui for:
 - Quick actions to open app/quarantine directories and clear history
 - Snapshot delta between latest runs for duplicates/leftovers/waste
 - Operator notes pad included in exported report payload
+- Built-in Release Manager with GitHub latest-release checks
+- Auto-update polling at startup and every 3 minutes
+- Downloaded update staging with one-click restart/install
 
 ## Run
 1. Install Rust from https://rustup.rs
@@ -50,8 +53,18 @@ cargo run --release
 ```
 
 ## Safety
-This prototype only scans and reports candidates. It does not auto-delete files.
-Review results before removing anything.
+Cleanup can quarantine, delete, or secure-delete depending on mode.
+Review results before destructive actions and keep critical paths in ignore rules.
+
+## Release Manager + Auto Updating
+- Uses GitHub Releases API (`/releases/latest`) to check for newer builds
+- Checks automatically at startup and every 3 minutes when enabled
+- Manual `Check Updates` button in `Tool Deck -> Release Manager`
+- Downloads the latest `.exe` into `%APPDATA%/NexusPcCleaner/updates/`
+- `Restart and Install Downloaded Update` runs the same replacement pattern as the reference app:
+  - launches a temporary `.cmd`
+  - retries copy over current executable until unlocked
+  - relaunches updated executable
 
 ## 15 New Tools/Upgrades In This Overhaul
 1. Multi-tab control panel layout
